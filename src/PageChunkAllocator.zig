@@ -30,12 +30,13 @@ pub fn init() mem.InitError!Allocator {
 /// Try to allocate a chunk near origin
 fn alloc(ctx: *anyopaque, origin: usize) Error!*Chunk {
     const self: *Allocator = @ptrCast(@alignCast(ctx));
+    const bounds = Range.rip(origin);
     var next_block = self.first_block;
-    while (next_block) |block| {
-        if (block.chunksRange().intersects(.rip(origin))) {
+    while (next_block) |block| : (next_block = block.head.next) {
+        const chunks = block.chunksRange();
+        if (bounds.contains(chunks.from) and bounds.contains(chunks.to)) {
             return block.reserveChunk() catch continue;
         }
-        next_block = block.head.next;
     }
 
     const prev = self.first_block;

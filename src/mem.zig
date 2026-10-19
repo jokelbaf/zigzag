@@ -163,41 +163,27 @@ pub const Range = struct {
     to: usize,
 
     pub fn contains(r: Range, addr: usize) bool {
-        return r.from >= addr and r.to <= addr;
+        return addr >= r.from and addr <= r.to;
     }
 
     pub fn intersects(a: Range, b: Range) bool {
-        return a.from >= b.from or a.to <= b.to;
+        return a.from <= b.to and b.from <= a.to;
     }
 
     /// Construct the range [origin - x; origin + x]
     pub fn symmetric(origin: usize, x: u32) Range {
         return .{
-            .from = origin - x,
-            .to = origin + x,
+            .from = origin -| x,
+            .to = origin +| x,
         };
     }
 
     /// Calculate max and min possible addresses for the trampoline relative to the target address
     pub fn rip(addr: usize) Range {
         const min_addr = mmap_min_addr.load(.acquire);
-        const to = b: {
-            if (addr > std.math.maxInt(usize) - std.math.maxInt(i32)) break :b std.math.maxInt(usize);
-            break :b addr + std.math.maxInt(i32);
-        };
-
-        if (addr < std.math.maxInt(i32) + 1) {
-            return .{
-                .from = min_addr,
-                .to = to,
-            };
-        }
-
-        const from: usize = addr - std.math.maxInt(u32) / 2;
-        return .{
-            .from = if (from < min_addr) min_addr else from,
-            .to = to,
-        };
+        var bounds = symmetric(addr, std.math.maxInt(i32));
+        bounds.from = @max(bounds.from, min_addr);
+        return bounds;
     }
 
     test {
@@ -222,43 +208,26 @@ pub const QueryError = switch (target) {
     else => unreachable,
 };
 
-fn vmaGapSize(addr: usize) QueryError!usize {
-    var q: procmap.ProcmapQuery = .{
-        .query_addr = addr,
-        .query_flags = .{ .covering_or_next_vma = true },
-    };
-    try q.query();
-
-    // no further VMAs are mapped
-    if (q.query_addr >= q.vma_end) {
-        return std.math.maxInt(usize) - addr;
-    }
-
-    return q.vma_start - addr;
-}
-
 /// Returns the starting address of a page that starts within the range
 fn findUnmappedAreaWithinLinux(bounds: Range, gap_size: usize) QueryError!?usize {
     const page_size = std.heap.pageSize();
+    const max_start = bounds.to - (gap_size - 1);
     var q: procmap.ProcmapQuery = .{
-        .query_addr = bounds.from,
+        .query_addr = std.mem.alignBackward(usize, std.math.add(usize, bounds.from, page_size - 1) catch return null, page_size),
         .query_flags = .{ .covering_or_next_vma = true },
     };
 
-    try q.query();
-    while (q.vma_end <= bounds.to) {
-        // no further VMAs are mapped
-        if (q.query_addr >= q.vma_end) {
-            return q.vma_end;
-        }
+    while (q.query_addr <= max_start) {
+        q.query() catch |err| switch (err) {
+            error.NotFound => return q.query_addr,
+            else => return err,
+        };
 
-        // we found a gap between VMAs
-        if (q.vma_start > q.query_addr and try vmaGapSize(std.mem.alignBackward(usize, q.query_addr, page_size)) >= gap_size) {
-            return std.mem.alignBackward(usize, q.query_addr, page_size);
+        if (q.vma_start > q.query_addr and q.vma_start - q.query_addr >= gap_size) {
+            return q.query_addr;
         }
 
         q.query_addr = q.vma_end;
-        try q.query();
     }
 
     return null;
@@ -267,8 +236,9 @@ fn findUnmappedAreaWithinLinux(bounds: Range, gap_size: usize) QueryError!?usize
 /// Returns an address contained within a page that starts within the provided range
 fn findUnmappedAreaWithinWindows(bounds: Range, gap_size: usize) QueryError!?usize {
     const granularity = allocation_granularity.load(.monotonic);
-    var probe_address = std.mem.alignBackward(usize, bounds.from, granularity);
-    while (probe_address < bounds.to) {
+    const max_start = bounds.to - (gap_size - 1);
+    var probe_address = std.mem.alignBackward(usize, std.math.add(usize, bounds.from, granularity - 1) catch return null, granularity);
+    while (probe_address <= max_start) {
         var memory_info: kernel32.MEMORY_BASIC_INFORMATION = undefined;
         const info_size = kernel32.VirtualQuery(@ptrFromInt(probe_address), &memory_info, @sizeOf(@TypeOf(memory_info)));
 
@@ -276,13 +246,14 @@ fn findUnmappedAreaWithinWindows(bounds: Range, gap_size: usize) QueryError!?usi
             return error.Unexpected;
         }
 
-        if (memory_info.State == kernel32.MEM_FREE and memory_info.RegionSize >= gap_size) {
+        const region_end = std.math.add(usize, @intFromPtr(memory_info.BaseAddress), memory_info.RegionSize) catch return null;
+        if (region_end <= probe_address) return error.Unexpected;
+
+        if (memory_info.State == kernel32.MEM_FREE and region_end - probe_address >= gap_size) {
             return probe_address;
         }
 
-        probe_address = @intFromPtr(memory_info.BaseAddress) + memory_info.RegionSize;
-        probe_address += granularity - 1;
-        probe_address = std.mem.alignBackward(usize, probe_address, granularity);
+        probe_address = std.mem.alignBackward(usize, std.math.add(usize, region_end, granularity - 1) catch return null, granularity);
     }
 
     return null;
@@ -291,6 +262,8 @@ fn findUnmappedAreaWithinWindows(bounds: Range, gap_size: usize) QueryError!?usi
 /// bounds: min & max address where we're looking for an unallocated vma
 /// size: minimum size of the vma required
 pub fn findUnmappedAreaWithin(bounds: Range, size: usize) QueryError!?usize {
+    if (bounds.from > bounds.to or size == 0 or size - 1 > bounds.to - bounds.from) return null;
+
     return switch (target) {
         .windows => findUnmappedAreaWithinWindows(bounds, size),
         .linux => findUnmappedAreaWithinLinux(bounds, size),

@@ -54,8 +54,15 @@ pub fn init(address: usize) AllocBlockError!*SharedExecutableBlock {
 }
 
 pub fn initNearAddress(address: usize) AllocBlockError!*SharedExecutableBlock {
-    const region = try mem.findUnmappedAreaWithin(.rip(address), memory_block_size) orelse return AllocBlockError.UnavailableNearbyPage;
-    return init(region);
+    const bounds = mem.Range.rip(address);
+    const region = try mem.findUnmappedAreaWithin(bounds, memory_block_size) orelse return AllocBlockError.UnavailableNearbyPage;
+    const block = try init(region);
+    errdefer block.deinit();
+
+    const chunks = block.chunksRange();
+    if (!bounds.contains(chunks.from) or !bounds.contains(chunks.to)) return error.UnavailableNearbyPage;
+
+    return block;
 }
 
 pub fn deinit(self: *SharedExecutableBlock) void {
@@ -100,6 +107,6 @@ pub fn contains(self: *const SharedExecutableBlock, chunk: *const Chunk) bool {
 pub fn chunksRange(block: *const SharedExecutableBlock) mem.Range {
     return .{
         .from = @intFromPtr(&block.chunks),
-        .to = @intFromPtr(block) + @sizeOf(SharedExecutableBlock),
+        .to = @intFromPtr(block) + @sizeOf(SharedExecutableBlock) - 1,
     };
 }

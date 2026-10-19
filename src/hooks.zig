@@ -24,49 +24,49 @@ fn writeTrampolineBody(dest: usize, source: usize) TrampolineWriteError!usize {
     var trampoline_writer = std.Io.Writer.fixed(dest_bytes[0..trampoline_buffer_size]);
 
     var disassembler = Disassembler.init(source_bytes[0 .. min_size + max_instruction_size]);
+    while (disassembler.pos < min_size) {
+        _ = try disassembler.next() orelse return error.CannotEncode;
+    }
+    const copied_size = disassembler.pos;
+    disassembler.pos = 0;
 
     var last_pos: usize = 0;
 
-    while (try disassembler.next()) |ins| : (last_pos = disassembler.pos) {
-        if (last_pos >= min_size) {
-            break;
-        }
+    while (last_pos < copied_size) : (last_pos = disassembler.pos) {
+        const ins = try disassembler.next() orelse return error.CannotEncode;
 
         std.debug.assert(ins.encoding.data.opc.len > 0);
         // std.debug.print("{}\n", .{ins});
 
         const ins_buf = source_bytes[last_pos..disassembler.pos];
-        const opcode = ins.encoding.data.opc[0];
         const cpy_ins_addr = dest + trampoline_writer.end;
         const ins_addr = @intFromPtr(ins_buf.ptr);
-
-        // TODO: A relative instruction might be outside of the possible range.
-        // Return an error in these cases or refactor to rewrite relative instructions to be absolute
 
         if (ripOpIndex(ins.ops)) |op_index| {
             // instruction contains a %rip operand
 
-            const abs_ins_diff: isize = if (ins_addr > cpy_ins_addr) @intCast(ins_addr - cpy_ins_addr) else @as(isize, @intCast(cpy_ins_addr - ins_addr)) - 1;
-            const new_disp = abs_ins_diff + ins.ops[op_index].mem.m_rip.disp;
+            const new_disp = try relocatedDisplacement(ins_addr, cpy_ins_addr, ins.ops[op_index].mem.m_rip.disp);
 
             const rip_dest = applyOffset(ins_addr, ins.ops[op_index].mem.m_rip.disp); // omitted instruction len because it's irrelevant for the calculation
             const new_dest = applyOffset(cpy_ins_addr, new_disp);
             std.debug.assert(rip_dest == new_dest);
 
             var cpy_ins = ins;
-            cpy_ins.ops[op_index].mem.m_rip.disp = @intCast(new_disp);
+            cpy_ins.ops[op_index].mem.m_rip.disp = new_disp;
 
             try cpy_ins.encode(&trampoline_writer, .{});
-        } else if (opcode == 0xE8 or opcode == 0xE9 or
-            opcode & 0xF0 == 0x70 or opcode & 0xFC == 0xE0 or ins.encoding.data.opc[1] & 0xF0 == 0x80)
-        {
-            const diff: i32 = @intCast(mem.delta(ins_addr, cpy_ins_addr));
-            const new_disp = diff + ins.ops[0].imm.signed;
+        } else if (ins.encoding.data.ops[0] == .rel8 or ins.encoding.data.ops[0] == .rel16 or ins.encoding.data.ops[0] == .rel32) {
+            const original_dest = applyOffset(ins_addr + ins_buf.len, ins.ops[0].imm.signed);
 
-            const original_dest = applyOffset(ins_addr, ins.ops[0].imm.signed);
+            if (original_dest < source or original_dest >= source + copied_size) {
+                const new_disp = try relocatedDisplacement(ins_addr, cpy_ins_addr, ins.ops[0].imm.signed);
+                switch (ins.encoding.data.ops[0]) {
+                    .rel8 => _ = std.math.cast(i8, new_disp) orelse return error.CannotEncode,
+                    .rel16 => _ = std.math.cast(i16, new_disp) orelse return error.CannotEncode,
+                    else => {},
+                }
 
-            if (applyOffset(ins_addr, new_disp) + ins_buf.len > dest + min_size) {
-                const new_dest = applyOffset(cpy_ins_addr, new_disp);
+                const new_dest = applyOffset(cpy_ins_addr + ins_buf.len, new_disp);
                 std.debug.assert(original_dest == new_dest);
 
                 var cpy_ins = ins;
@@ -81,9 +81,15 @@ fn writeTrampolineBody(dest: usize, source: usize) TrampolineWriteError!usize {
             // simply copy the exact instruction. No need to reencode
             try trampoline_writer.writeAll(ins_buf);
         }
+
+        if (trampoline_writer.end != disassembler.pos) return error.CannotEncode;
     }
 
     return last_pos;
+}
+
+fn relocatedDisplacement(source: usize, dest: usize, displacement: i32) error{CannotEncode}!i32 {
+    return std.math.cast(i32, @as(i128, source) - @as(i128, dest) + displacement) orelse error.CannotEncode;
 }
 
 fn applyOffset(n: usize, offset: isize) usize {
@@ -138,15 +144,20 @@ pub fn Hook(comptime T: type) type {
             const target_bytes: [*]u8 = @ptrCast(target);
             const original_instructions: [30]u8 = target_bytes[0..30].*;
 
-            // allow writing instructions in the pages that need to be patched
-            const pages = getPages(target_address);
-            const prot = try mem.protect(pages, .everything);
-
             const trampoline_buffer = try chunk_allocator.alloc(target_address);
+            errdefer chunk_allocator.free(trampoline_buffer);
+
             const trampoline_size = try writeTrampolineBody(@intFromPtr(trampoline_buffer), target_address);
 
             const jmp_to_resume: JMP_ABS = .{ .addr = target_address + trampoline_size };
             @memcpy(trampoline_buffer[trampoline_size .. trampoline_size + @sizeOf(JMP_ABS)], @as([*]const u8, @ptrCast(&jmp_to_resume)));
+
+            const pages = getPages(target_address);
+            const prot = try mem.protect(pages, .everything);
+            errdefer {
+                @memcpy(target_bytes[0..original_instructions.len], &original_instructions);
+                _ = mem.protect(pages, prot) catch {};
+            }
 
             const jmp_to_hook: JMP_ABS = .{ .addr = @intFromPtr(payload) };
             @memcpy(target_bytes[0..@sizeOf(JMP_ABS)], @as([*]const u8, @ptrCast(&jmp_to_hook)));
